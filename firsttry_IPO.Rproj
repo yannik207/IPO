@@ -1,0 +1,218 @@
+install.packages("tidyquant")
+install.packages("riingo")
+install.packages("tidyverse")
+install.packages("plotly")
+install.packages("roll")
+install.packages("tictoc")
+install.packages("pins")
+library(tidyquant)
+library(dplyr)
+library(tidyverse)
+library(plotly)
+library(riingo)
+library(roll)
+library(tictoc)
+#Tiingo login 
+riingo_browse_signup()
+riingo_browse_token() 
+riingo_set_token("34f1b513c1aa79ef8eb5496fb387c48309ad66a5")
+nasdaq <-
+  tq_exchange("NASDAQ")
+
+amex  <- 
+  tq_exchange("AMEX")
+
+nyse <- 
+  tq_exchange("NYSE")
+
+company_ipo_sector <-
+  nasdaq %>% 
+  bind_rows(amex) %>% 
+  bind_rows(nyse) %>% 
+  select(symbol, company, ipo.year, sector) %>% 
+  filter(!is.na(ipo.year)& ipo.year < 2015)
+
+#downloading all ticker but need to divide it in smaller subsets and pull in the data in pieces so I dont hit my tiingo API limits
+tickers_2004_2006 <-
+  company_ipo_sector %>% 
+  distinct(company, .keep_all = TRUE) %>% 
+  filter(!is.na(sector) &  between(ipo.year, 2004, 2006)) %>% 
+  group_by(ipo.year) %>%
+  pull(symbol)
+
+tickers_2007_2009 <-
+  company_ipo_sector %>% 
+  distinct(company, .keep_all = TRUE) %>%
+  filter(!is.na(sector) &  between(ipo.year, 2007, 2009)) %>% 
+  group_by(ipo.year) %>%
+  pull(symbol)
+
+tickers_2010_2012 <-
+  company_ipo_sector %>% 
+  distinct(company, .keep_all = TRUE) %>% 
+  filter(!is.na(sector) &  between(ipo.year, 2010, 2012)) %>% 
+  group_by(ipo.year) %>%
+  pull(symbol)
+
+tickers_2013_2014 <-
+  company_ipo_sector %>% 
+  distinct(company, .keep_all = TRUE) %>% 
+  filter(!is.na(sector) &  between(ipo.year, 2013, 2014)) %>% 
+  group_by(ipo.year) %>%
+  pull(symbol)
+
+#download the prices for all ticker 
+prices_riingo_2004_2006 <-
+  tickers_2004_2006 %>%
+  riingo_prices(start_date = "2004-01-01", resample_frequency = "monthly") %>% 
+  group_by(ticker)
+
+prices_riingo_2007_2009 <-
+  tickers_2007_2009 %>%
+  riingo_prices(start_date = "2007-01-01", resample_frequency = "monthly") %>% 
+  group_by(ticker)
+
+prices_riingo_2010_2012 <-
+  tickers_2010_2012 %>%
+  riingo_prices(start_date = "2010-01-01", resample_frequency = "monthly") %>% 
+  group_by(ticker)
+
+prices_riingo_2013_2014 <-
+  tickers_2013_2014 %>%
+  riingo_prices(start_date = "2013-01-01", resample_frequency = "monthly") %>% 
+  group_by(ticker)
+#appending all IPO's
+prices_riingo_full <-
+  prices_riingo_2004_2006 %>% 
+  bind_rows(prices_riingo_2007_2009) %>%
+  bind_rows(prices_riingo_2010_2012) %>%
+  bind_rows(prices_riingo_2013_2014)
+#adding columne monthly_returns
+prices_riingo_full <-
+  prices_riingo_full %>% 
+  group_by(ticker) %>% 
+  mutate(monthly_returns = close/lag(close) - 1)
+#downloading the S&P 500 as a benchmark for the portfolio
+spy_benchmark <- 
+  "SPY" %>%
+  riingo_prices(start_date = "2004-01-01", end_date = "2019-10-31",  resample_frequency = "monthly") %>% 
+  select(ticker, date, close) %>% 
+  mutate(spy_monthly_returns = close/lag(close) -  1) %>% 
+  na.omit()
+#remove wrong IPO's
+tickers_remove_mismatch_dates <- 
+  prices_riingo_full1 %>% 
+  left_join(company_ipo_sector, by = c("ticker" = "symbol")) %>% 
+  filter(date == min(date)) %>% 
+  select(ticker, date, ipo.year) %>% 
+  mutate(first_trade = year(date)) %>% 
+  filter(ipo.year != first_trade) %>% 
+  pull(ticker)
+
+prices_riingo_full1 <- 
+  prices_riingo_full1 %>% 
+  filter(!(ticker %in% tickers_remove_mismatch_dates) & ticker != 'PGTI')
+
+prices_riingo_full1 <- 
+  prices_riingo_full1 %>% 
+  left_join(company_ipo_sector, by = c("ticker" = "symbol")) 
+
+ipo_by_year_portfolios <- function(year, show_growth = F){
+  
+  prices_riingo_full1 %>%
+    select(ticker, date, monthly_returns, ipo.year) %>% 
+    filter(ipo.year == year) %>% 
+    tq_portfolio(assets_col  = ticker,
+                 returns_col = monthly_returns,
+                 col_rename  = paste(year, "_port_returns", sep = ""),
+                 wealth.index = show_growth,
+                 rebalance_on = "months")
+  
+}
+
+years_numeric <- seq(2004, 2014, by = 1)
+
+returns_each_year_ipo_portfolios <-
+  map(years_numeric, ipo_by_year_portfolios) %>% 
+  reduce(left_join)
+#computing the sharpe ratios 
+port_sharpes <-
+  returns_each_year_ipo_portfolios %>%
+  pivot_longer(-date, names_to = "portfolio_by_year", values_to = "monthly_return") %>%
+  group_by(portfolio_by_year) %>%
+  arrange(portfolio_by_year, date) %>%
+  filter(!is.na(monthly_return)) %>%
+  tq_performance(Ra = monthly_return,
+                 performance_fun = SharpeRatio,
+                 Rf = 0,
+                 FUN= "StdDev") %>%
+  `colnames<-`(c("portfolio_by_year", "port_sharpe"))%>%
+  add_column(year = years_numeric)
+#plotting the sharpe ratios 
+(
+  port_sharpes %>% 
+    ggplot(aes(x = year, y = port_sharpe, fill = portfolio_by_year)) + 
+    geom_col(width = .4) +
+    scale_x_continuous(breaks = scales::pretty_breaks(n = 10)) +
+    labs(x = "", y = "sharpe by year", title = "IPO Portfolio Sharpe Ratios") +
+    theme_minimal()
+) %>% 
+  ggplotly()
+#first try to compaire the S&P500 with all Ipo's in 2004, 2005 and 2006
+spy04<-spy_benchmark[1:11,]
+
+prices_riingo_full4 <-
+  prices_riingo_2004_2006 %>% 
+  group_by(ticker) %>% 
+  mutate(monthly_returns = close/lag(close) - 1)
+
+tickers_remove_mismatch_dates4 <- 
+   prices_riingo_full4 %>% 
+   left_join(company_ipo_sector, by = c("ticker" = "symbol")) %>% 
+  filter(date == min(date)) %>% 
+   select(ticker, date, ipo.year) %>% 
+   mutate(first_trade = year(date)) %>% 
+   filter(ipo.year != first_trade) %>% 
+   pull(ticker)
+
+prices_riingo_full4 <- 
+  prices_riingo_full4 %>% 
+  filter(!(ticker %in% tickers_remove_mismatch_dates) & ticker != 'PGTI')
+
+ipo_by_year_portfolios4 <- function(year, show_growth = F){
+  prices_riingo_full4 %>%
+ select(ticker, date, monthly_returns, ipo.year) %>% 
+ filter(ipo.year == year) %>% 
+ tq_portfolio(assets_col  = ticker,
+       returns_col = monthly_returns,
+       col_rename  = paste(year, "_port_returns", sep = ""),
+       wealth.index = show_growth,
+       rebalance_on = "months")
+}
+
+years_numeric4 <- seq(2004, 2006, by = 1)
+ returns_each_year_ipo_portfolios4 <-
+   map(years_numeric4, ipo_by_year_portfolios4) %>% 
+   reduce(left_join)
+ 
+ datereturn_2004<-returns_each_year_ipo_portfolios4[1:12,]
+ datereturn_2005<-returns_each_year_ipo_portfolios4[13:24,]
+ datereturn_2006<-returns_each_year_ipo_portfolios4[25:36,]
+ return04<-datereturn_2004[,1:2]
+ return05<-datereturn_2005[,c(1,3)]
+ return0405<-cbind(t(return04), t(return05))
+ 
+ spy04<-spy_benchmark[1:12,]
+ spy05<-spy_benchmark[13:24,]
+ spy06<-spy_benchmark[25:36,]
+ sp04
+ 
+ benching<-cbind(spy04$spy_monthly_returns, datereturn_2004$`2004_port_returns`)
+ benching05<-cbind(spy05$spy_monthly_returns, datereturn_2005$`2005_port_returns`)
+ benching06<-cbind(spy06$spy_monthly_returns, datereturn_2006$`2006_port_returns`)
+plot(benching[,1], type = "l", col = "red", xlab = "Monate", ylab = "Return", main = "Vergleich der Rendite von beiden Portfolios", cex.lab = 1.5,  )
+lines(benching[,2], type = "l", col = "blue")
+plot(benching05[,1], type = "l", col = "red", xlab = "Monate", ylab = "Return", main = "Vergleich der Rendite von beiden Portfolios", cex.lab = 1.5,  )
+lines(benching05[,2], type = "l", col = "blue")
+plot(benching06[,1], type = "l", col = "red", xlab = "Monate", ylab = "Return", main = "Vergleich der Rendite von beiden Portfolios", cex.lab = 1.5,  )
+lines(benching06[,2], type = "l", col = "blue")
